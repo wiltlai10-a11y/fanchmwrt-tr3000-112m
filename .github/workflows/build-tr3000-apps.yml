@@ -1,0 +1,341 @@
+# ==============================================================================
+# 云端编译 Cudy TR3000 v1 的 FanChmWrt 112M 大分区固件（多版本并行）
+#
+# 三个变体并行跑（仓库是 public，Actions 免费额度不限）：
+#   full  = 应用中心 + ttyd + homeproxy          （全家桶，看体积决定要不要）
+#   slim  = 应用中心 + ttyd                      （去掉 homeproxy 的瘦身版）
+#   turbo = 应用中心 + ttyd + turboacc           （试验性，可能编不过）
+#
+# 共同底座：112M 分区补丁 + OpenClash + 全套 USB 上网 + fwx 应用过滤 + 应用中心
+# ==============================================================================
+
+name: Build TR3000 (Apps)
+
+on:
+  workflow_dispatch:
+    inputs:
+      layout:
+        description: 'U-Boot 大分区布局'
+        required: true
+        default: '112m'
+        type: choice
+        options:
+          - 112m
+          - 114m
+      include_iphone:
+        description: '集成 iPhone USB 共享 (ipheth + usbmuxd，约 +3.5 MiB)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, slim, turbo]
+
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      SRC: fanchmwrt
+
+    steps:
+      - name:  checkout
+        uses: actions/checkout@v4
+
+      - name:  释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/az \
+                      /usr/local/share/powershell /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name:  安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk \
+            gettext git gperf help2man intltool libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool libyaml-dev lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name:  ccache 缓存（共用 112m 前缀，尽量命中）
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-112m-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-112m-
+
+      - name:  拉取 FanChmWrt 源码
+        run: |
+          git clone --depth=1 https://github.com/fanchmwrt/fanchmwrt.git "$SRC"
+          cd "$SRC"
+          echo "版本基线: $(cat version 2>/dev/null || echo unknown)"
+        env:
+          SRC: fanchmwrt
+
+      - name:  更新 feeds
+        run: |
+          cd "$SRC"
+          sed -i '/telephony/d; /\/video.git/d' feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+        env:
+          SRC: fanchmwrt
+
+      - name:  [turbo] 打 turboacc（试验性：会替换 firewall4/nftables 并打内核补丁）
+        if: matrix.variant == 'turbo'
+        run: |
+          cd "$SRC"
+          curl -sSL https://raw.githubusercontent.com/chenmozhijin/turboacc/luci/add_turboacc.sh -o add_turboacc.sh
+          bash add_turboacc.sh --no-sfe
+          ./scripts/feeds install -a
+          ls -d package/luci-app-turboacc 2>/dev/null || echo "::warning::没找到 luci-app-turboacc 目录"
+        env:
+          SRC: fanchmwrt
+
+      - name:  [full] 加入 homeproxy
+        if: matrix.variant == 'full'
+        run: |
+          cd "$SRC"
+          git clone --depth=1 https://github.com/immortalwrt/homeproxy.git package/homeproxy
+          ./scripts/feeds install -a
+        env:
+          SRC: fanchmwrt
+
+      - name:  加入 OpenClash
+        run: |
+          cd "$SRC"
+          git clone --depth=1 https://github.com/vernesong/OpenClash.git package/OpenClash
+          ./scripts/feeds install -a
+        env:
+          SRC: fanchmwrt
+
+      - name:  ★ 打 112M/114M 分区补丁
+        run: |
+          cd "$SRC"
+          case "${{ github.event.inputs.layout }}" in
+            112m) HEX=0x7000000; K=114688k ;;
+            114m) HEX=0x7280000; K=117248k ;;
+          esac
+          echo "reg=<0x5c0000 $HEX>  IMAGE_SIZE=$K"
+          sed -i "s/reg = <0x5c0000 0x4000000>;/reg = <0x5c0000 $HEX>;/" \
+            target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts
+          awk -v size="$K" '
+            /^define Device\/cudy_tr3000-v1[[:space:]]*$/ { b=1 }
+            b && /^[[:space:]]*IMAGE_SIZE[[:space:]]*:=/ { sub(/:=.*/, ":= " size); b=0 }
+            { print }
+          ' target/linux/mediatek/image/filogic.mk > /tmp/filogic.mk
+          mv /tmp/filogic.mk target/linux/mediatek/image/filogic.mk
+          grep -q "reg = <0x5c0000 $HEX>;" target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts \
+            || { echo "::error::DTS 补丁失败"; exit 1; }
+          awk '/^define Device\/cudy_tr3000-v1[[:space:]]*$/,/^endef/' \
+            target/linux/mediatek/image/filogic.mk | grep -q "IMAGE_SIZE := $K" \
+            || { echo "::error::filogic.mk 补丁失败"; exit 1; }
+          echo "::notice::分区补丁已应用并校验通过"
+        env:
+          SRC: fanchmwrt
+
+      - name:  预置文件（USB tethering 自动加入 WAN）
+        run: |
+          cd "$SRC"
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/90-usb-tethering <<'EOF'
+          #!/bin/sh
+          uci set network.wan_usb=interface
+          uci set network.wan_usb.proto='dhcp'
+          uci set network.wan_usb.device='usb0'
+          uci set network.wan_usb.peerdns='0'
+          uci set network.wan_usb.dns='223.5.5.5 119.29.29.29'
+          uci set network.wan_usb.metric='50'
+          uci add_list firewall.@zone[1].network='wan_usb'
+          uci commit network
+          uci commit firewall
+          mkdir -p /etc/modules.d
+          for m in cdc_ether cdc_ncm rndis_host huawei_cdc_ncm ipheth ax88179_178a asix rtl8152 cdc_mbim qmi_wwan; do
+            echo "$m" >> /etc/modules.d/90-usb-net
+          done
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/90-usb-tethering
+        env:
+          SRC: fanchmwrt
+
+      - name:  生成 .config
+        run: |
+          cd "$SRC"
+          {
+            echo "CONFIG_TARGET_mediatek=y"
+            echo "CONFIG_TARGET_mediatek_filogic=y"
+            echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+            echo "CONFIG_TARGET_ROOTFS_INITRAMFS=y"
+
+            echo "CONFIG_PACKAGE_luci=y"
+            echo "CONFIG_PACKAGE_luci-compat=y"
+            echo "CONFIG_PACKAGE_luci-mod-admin-full=y"
+            echo "CONFIG_PACKAGE_luci-mod-network=y"
+            echo "CONFIG_PACKAGE_luci-mod-status=y"
+            echo "CONFIG_PACKAGE_luci-mod-system=y"
+            echo "CONFIG_PACKAGE_luci-theme-bootstrap=y"
+            echo "CONFIG_PACKAGE_luci-app-firewall=y"
+            echo "CONFIG_PACKAGE_luci-app-package-manager=y"
+            echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y"
+
+            # ---- 应用过滤 + 应用中心 ----
+            echo "CONFIG_PACKAGE_luci-app-fwx-appfilter=y"
+            echo "CONFIG_PACKAGE_fwxd=y"
+            echo "CONFIG_PACKAGE_kmod-fwx=y"
+            echo "CONFIG_PACKAGE_luci-app-fwx-resources=y"
+            echo "CONFIG_PACKAGE_luci-app-fwx-app-center=y"
+            echo "CONFIG_PACKAGE_luci-i18n-fwx-app-center-zh-cn=y"
+
+            # ---- 终端 ----
+            echo "CONFIG_PACKAGE_luci-app-ttyd=y"
+            echo "CONFIG_PACKAGE_ttyd=y"
+
+            # ---- USB 上网 ----
+            echo "CONFIG_PACKAGE_kmod-usb-core=y"
+            echo "CONFIG_PACKAGE_kmod-usb2=y"
+            echo "CONFIG_PACKAGE_kmod-usb3=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net=y"
+            echo "CONFIG_PACKAGE_kmod-mii=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-rndis=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-asix=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-asix-ax88179=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-rtl8152=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-mcs7830=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-sr9700=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-dm9601=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-smsc95xx=y"
+            echo "CONFIG_PACKAGE_kmod-usb-wdm=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y"
+            echo "CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y"
+            echo "CONFIG_PACKAGE_kmod-usb-serial=y"
+            echo "CONFIG_PACKAGE_kmod-usb-serial-wwan=y"
+            echo "CONFIG_PACKAGE_kmod-usb-serial-option=y"
+            echo "CONFIG_PACKAGE_usb-modeswitch=y"
+            echo "CONFIG_PACKAGE_uqmi=y"
+            echo "CONFIG_PACKAGE_umbim=y"
+            echo "CONFIG_PACKAGE_usbutils=y"
+            echo "CONFIG_PACKAGE_kmod-nls-utf8=y"
+            echo "CONFIG_PACKAGE_kmod-usb-storage=y"
+            echo "CONFIG_PACKAGE_kmod-usb-storage-uas=y"
+            echo "CONFIG_PACKAGE_block-mount=y"
+            echo "CONFIG_PACKAGE_kmod-fs-vfat=y"
+            echo "CONFIG_PACKAGE_kmod-fs-exfat=y"
+            echo "CONFIG_PACKAGE_kmod-fs-ext4=y"
+
+            # ---- OpenClash ----
+            echo "CONFIG_PACKAGE_luci-app-openclash=y"
+            echo "CONFIG_PACKAGE_dnsmasq=n"
+            echo "CONFIG_PACKAGE_dnsmasq_full_nftset=y"
+            echo "CONFIG_PACKAGE_bash=y"
+            echo "CONFIG_PACKAGE_curl=y"
+            echo "CONFIG_PACKAGE_ca-bundle=y"
+            echo "CONFIG_PACKAGE_ip-full=y"
+            echo "CONFIG_PACKAGE_ruby=y"
+            echo "CONFIG_PACKAGE_ruby-yaml=y"
+            echo "CONFIG_PACKAGE_kmod-tun=y"
+            echo "CONFIG_PACKAGE_unzip=y"
+            echo "CONFIG_PACKAGE_kmod-inet-diag=y"
+            echo "CONFIG_PACKAGE_kmod-nft-tproxy=y"
+            echo "CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y"
+
+            # ---- 变体差异 ----
+            case "${{ matrix.variant }}" in
+              full)
+                echo "CONFIG_PACKAGE_luci-app-homeproxy=y"
+                ;;
+              turbo)
+                echo "CONFIG_PACKAGE_luci-app-turboacc=y"
+                ;;
+            esac
+
+            if [ "${{ github.event.inputs.include_iphone }}" = "true" ]; then
+              echo "CONFIG_PACKAGE_kmod-usb-net-ipheth=y"
+              echo "CONFIG_PACKAGE_usbmuxd=y"
+              echo "CONFIG_PACKAGE_libusbmuxd=y"
+              echo "CONFIG_PACKAGE_libimobiledevice=y"
+              echo "CONFIG_PACKAGE_libplist=y"
+            fi
+          } > .config
+          make defconfig
+
+          echo "=== 关键项复核（缺了会在这里露出来）==="
+          for p in luci-app-ttyd ttyd luci-app-fwx-app-center luci-app-homeproxy \
+                   luci-app-turboacc luci-app-openclash sing-box ruby \
+                   kmod-usb-net-cdc-ncm kmod-tun; do
+            if grep -q "^CONFIG_PACKAGE_$p=y$" .config; then
+              echo "  [OK]      $p"
+            else
+              echo "  [MISSING] $p"
+            fi
+          done
+        env:
+          SRC: fanchmwrt
+
+      - name:  下载源码包
+        run: |
+          cd "$SRC"
+          make download -j$(nproc) V=s
+        env:
+          SRC: fanchmwrt
+
+      - name:  编译
+        run: |
+          cd "$SRC"
+          export CCACHE_DIR="$HOME/.ccache"
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee build.log
+        env:
+          SRC: fanchmwrt
+
+      - name:  体积与产物核对
+        run: |
+          cd "$SRC/bin/targets/mediatek/filogic"
+          ls -lh
+          IMG=$(ls -1 *cudy_tr3000*squashfs-sysupgrade* 2>/dev/null | head -1)
+          if [ -z "$IMG" ]; then echo "::error::未找到 sysupgrade 镜像"; else
+            SZ=$(stat -c%s "$IMG")
+            echo "镜像: $IMG  大小: $((SZ/1048576)) MiB"
+            # overlay 估算：112M UBI 可用 ≈ 108 MiB
+            echo "估算 rootfs_data 剩余 ≈ $((108 - SZ/1048576)) MiB"
+          fi
+          # 不要用 sha256sum *，会撞上 packages/ 目录
+          find . -maxdepth 1 -type f -print0 | xargs -0 sha256sum > sha256sums
+          echo "=== manifest 关键包 ==="
+          for p in ttyd luci-app-fwx-app-center luci-app-homeproxy sing-box luci-app-turboacc luci-app-openclash; do
+            grep -E "^$p " *.manifest || echo "  [不在固件里] $p"
+          done
+        env:
+          SRC: fanchmwrt
+
+      - name:  上传固件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tr3000-${{ matrix.variant }}-${{ github.run_number }}
+          path: fanchmwrt/bin/targets/mediatek/filogic/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name:  失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.variant }}-${{ github.run_number }}
+          path: fanchmwrt/build.log
+          retention-days: 7
