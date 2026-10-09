@@ -1,0 +1,139 @@
+# ==============================================================================
+# 只编译 luci-app-fwx-app-center（应用中心）这一个包，产出 apk
+# 用途：已经刷好 112M 固件的机器，不想重刷，直接 apk add 装上应用中心
+#
+# 说明：
+#   - 复用 112m 全量编译时留下的 ccache（restore-keys 前缀匹配），所以比首次快很多
+#   - 只编包、不编镜像，不打分区补丁（本包与分区布局无关）
+# ==============================================================================
+
+name: Build App Center apk
+
+on:
+  workflow_dispatch:
+
+env:
+  SRC: fanchmwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name:  checkout（只为拿到 workflow 自身）
+        uses: actions/checkout@v4
+
+      - name:  释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/az \
+                      /usr/local/share/powershell /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name:  安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk \
+            gettext git gperf help2man intltool libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool libyaml-dev lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name:  ccache 缓存（复用 112m 全量编译的缓存）
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-112m-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-112m-
+
+      - name:  拉取 FanChmWrt 源码
+        run: |
+          git clone --depth=1 https://github.com/fanchmwrt/fanchmwrt.git "$SRC"
+          cd "$SRC"
+          echo "版本基线: $(cat version 2>/dev/null || echo unknown)"
+          git log -1 --format='commit=%H date=%cd' --date=iso
+
+      - name:  更新 feeds（去掉 telephony/video，省时间省磁盘）
+        run: |
+          cd "$SRC"
+          sed -i '/telephony/d; /\/video.git/d' feeds.conf.default
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name:  确认包目录存在
+        id: locate
+        run: |
+          cd "$SRC"
+          D=$(ls -d package/feeds/*/luci-app-fwx-app-center 2>/dev/null | head -1)
+          echo "包目录: ${D:-未找到}"
+          [ -n "$D" ] || { echo "::error::feed 里没有 luci-app-fwx-app-center"; exit 1; }
+          echo "PKGDIR=$D" >> $GITHUB_ENV
+
+      - name:  生成最小 .config
+        run: |
+          cd "$SRC"
+          {
+            echo "CONFIG_TARGET_mediatek=y"
+            echo "CONFIG_TARGET_mediatek_filogic=y"
+            echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+            echo "CONFIG_PACKAGE_luci=y"
+            echo "CONFIG_PACKAGE_luci-compat=y"
+            echo "CONFIG_PACKAGE_luci-app-fwx-resources=y"
+            echo "CONFIG_PACKAGE_luci-app-fwx-app-center=y"
+            echo "CONFIG_PACKAGE_luci-i18n-fwx-app-center-zh-cn=y"
+          } > .config
+          make defconfig
+          echo "=== 复核 ==="
+          grep -E 'DEVICE_|fwx' .config | sort
+
+      - name:  下载源码包
+        run: |
+          cd "$SRC"
+          make download -j$(nproc) V=s
+
+      - name:  ★ 只编译应用中心包
+        run: |
+          cd "$SRC"
+          export CCACHE_DIR="$HOME/.ccache"
+          set -o pipefail
+          make -j$(nproc) "$PKGDIR/compile" V=s 2>&1 | tee build.log
+
+      - name:  收集 apk
+        run: |
+          cd "$SRC"
+          mkdir -p out
+          find bin/packages -type f \( -name 'luci-app-fwx-app-center*.apk' \
+                                      -o -name 'luci-i18n-fwx-app-center*.apk' \) \
+               -exec cp -v {} out/ \;
+          # 顺手把签名公钥带上（想校验就用得着；不校验就用 --allow-untrusted）
+          find . -maxdepth 1 -type f -name '*.pub' -exec cp -v {} out/ \; 2>/dev/null || true
+          echo "=== out/ ==="
+          ls -lh out/
+          [ -n "$(ls -A out/)" ] || { echo "::error::没有产出任何 apk"; exit 1; }
+          (cd out && sha256sum * > sha256sums && cat sha256sums)
+
+      - name:  上传 apk
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-center-apk-${{ github.run_number }}
+          path: fanchmwrt/out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name:  失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appcenter-build-log-${{ github.run_number }}
+          path: fanchmwrt/build.log
+          retention-days: 7
