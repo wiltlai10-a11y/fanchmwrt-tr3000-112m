@@ -92,7 +92,7 @@ jobs:
         env:
           SRC: fanchmwrt
 
-      - name:  [turbo] 打 turboacc（试验性：会替换 firewall4/nftables 并打内核补丁）
+      - name:  "[turbo] 打 turboacc（试验性：会替换 firewall4/nftables 并打内核补丁）"
         if: matrix.variant == 'turbo'
         run: |
           cd "$SRC"
@@ -103,7 +103,7 @@ jobs:
         env:
           SRC: fanchmwrt
 
-      - name:  [full] 加入 homeproxy
+      - name:  "[full] 加入 homeproxy"
         if: matrix.variant == 'full'
         run: |
           cd "$SRC"
