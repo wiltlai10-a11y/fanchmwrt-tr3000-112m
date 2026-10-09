@@ -289,9 +289,14 @@ jobs:
           else
             echo "::notice::体积正常"
           fi
-          sha256sum * > sha256sums
+          # 注意：不要用 sha256sum *，会撞上 packages/ 目录导致失败
+          find . -maxdepth 1 -type f -print0 | xargs -0 sha256sum > sha256sums
+          echo "=== 镜像结构 ==="
+          tar tvf "$IMG" || true
 
       - name:  上传固件
+        # always()：即使上一步体积核对失败，也要把固件传出来（上次就是栽在这）
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fanchmwrt-tr3000-${{ github.event.inputs.layout }}-${{ github.run_number }}
