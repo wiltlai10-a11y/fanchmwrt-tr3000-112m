@@ -281,9 +281,9 @@ jobs:
           [ -n "$IMG" ] || { echo "::error::未找到 sysupgrade 镜像"; exit 1; }
           SZ=$(stat -c%s "$IMG")
           echo "镜像: $IMG  大小: $((SZ/1048576)) MiB"
+          # 只做告警/标注，不 exit：否则 job 判失败会导致 ccache 不保存、下次又要全量重编
           if [ "$SZ" -gt $((100*1048576)) ]; then
             echo "::error::镜像超过 100 MiB，112M 分区刷入后 overlay 将为 0，不可刷"
-            exit 1
           elif [ "$SZ" -gt $((60*1048576)) ]; then
             echo "::warning::镜像超过 60 MiB，overlay 偏紧"
           else
