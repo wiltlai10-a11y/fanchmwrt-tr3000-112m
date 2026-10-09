@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [full, slim, turbo]
+        variant: [all, full, slim, turbo]
 
     name: ${{ matrix.variant }}
     runs-on: ubuntu-24.04
@@ -92,8 +92,8 @@ jobs:
         env:
           SRC: fanchmwrt
 
-      - name:  "[turbo] 打 turboacc（试验性：会替换 firewall4/nftables 并打内核补丁）"
-        if: matrix.variant == 'turbo'
+      - name:  "[turbo] 打 turboacc（会替换 firewall4/nftables 并打内核补丁）"
+        if: ${{ matrix.variant == 'turbo' || matrix.variant == 'all' }}
         run: |
           cd "$SRC"
           curl -sSL https://raw.githubusercontent.com/chenmozhijin/turboacc/luci/add_turboacc.sh -o add_turboacc.sh
@@ -104,7 +104,7 @@ jobs:
           SRC: fanchmwrt
 
       - name:  "[full] 加入 homeproxy"
-        if: matrix.variant == 'full'
+        if: ${{ matrix.variant == 'full' || matrix.variant == 'all' }}
         run: |
           cd "$SRC"
           git clone --depth=1 https://github.com/immortalwrt/homeproxy.git package/homeproxy
@@ -260,6 +260,10 @@ jobs:
                 echo "CONFIG_PACKAGE_luci-app-homeproxy=y"
                 ;;
               turbo)
+                echo "CONFIG_PACKAGE_luci-app-turboacc=y"
+                ;;
+              all)
+                echo "CONFIG_PACKAGE_luci-app-homeproxy=y"
                 echo "CONFIG_PACKAGE_luci-app-turboacc=y"
                 ;;
             esac
