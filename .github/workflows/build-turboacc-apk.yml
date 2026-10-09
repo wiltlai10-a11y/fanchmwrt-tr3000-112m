@@ -1,0 +1,158 @@
+# ==============================================================================
+# 只编译 luci-app-turboacc（网络加速）这一个包，产出 apk
+# 用途：已经刷好 112M 固件的机器，不想重刷，直接 apk add 装上
+#
+# 说明：
+#   - chenmozhijin/turboacc 仓库整体挂进 package/，只编其中的 luci-app-turboacc
+#   - INCLUDE 选项与 turbo 全量变体保持一致：OFFLOADING + BBR + NFT_FULLCONE，无 SFE
+#   - 复用 ccache，预计 30~60 分钟
+# ==============================================================================
+
+name: Build TurboAcc apk
+
+on:
+  workflow_dispatch:
+
+env:
+  SRC: fanchmwrt
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name:  checkout（只为拿到 workflow 自身）
+        uses: actions/checkout@v4
+
+      - name:  释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/az \
+                      /usr/local/share/powershell /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name:  安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk \
+            gettext git gperf help2man intltool libelf-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool libyaml-dev lrzsz mkisofs msmtp ninja-build p7zip p7zip-full \
+            patch pkgconf python3 python3-pip python3-ply python3-docutils python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+            upx-ucl unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name:  ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-112m-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-112m-
+
+      - name:  拉取 FanChmWrt 源码
+        run: |
+          git clone --depth=1 https://github.com/fanchmwrt/fanchmwrt.git "$SRC"
+          cd "$SRC"
+          echo "版本基线: $(cat version 2>/dev/null || echo unknown)"
+          git log -1 --format='commit=%H date=%cd' --date=iso
+
+      - name:  更新 feeds（去掉 telephony/video，省时间省磁盘）
+        run: |
+          cd "$SRC"
+          sed -i '/telephony/d; /\/video.git/d' feeds.conf.default
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name:  挂载 turboacc 源码
+        run: |
+          cd "$SRC"
+          git clone --depth=1 https://github.com/chenmozhijin/turboacc.git package/turboacc
+          D=$(ls -d package/turboacc/luci-app-turboacc 2>/dev/null | head -1)
+          echo "包目录: ${D:-未找到}"
+          [ -n "$D" ] || { echo "::error::turboacc 仓库里没有 luci-app-turboacc"; exit 1; }
+          grep -m1 PKG_VERSION "$D/Makefile"
+          echo "PKGDIR=$D" >> $GITHUB_ENV
+
+      - name:  生成最小 .config
+        run: |
+          cd "$SRC"
+          {
+            echo "CONFIG_TARGET_mediatek=y"
+            echo "CONFIG_TARGET_mediatek_filogic=y"
+            echo "CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+            echo "CONFIG_PACKAGE_luci=y"
+            echo "CONFIG_PACKAGE_luci-compat=y"
+            echo "CONFIG_PACKAGE_luci-app-turboacc=y"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_OFFLOADING=y"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_BBR_CCA=y"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_NFT_FULLCONE=y"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE=n"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE_CM=n"
+            echo "CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE_DRV=n"
+            echo "CONFIG_PACKAGE_luci-i18n-turboacc-zh-cn=y"
+          } > .config
+          make defconfig
+          echo "=== 复核 ==="
+          grep -E 'DEVICE_|turboacc' .config | sort
+
+      - name:  下载源码包
+        run: |
+          cd "$SRC"
+          make download -j$(nproc) V=s
+
+      - name:  ★ 编译宿主机工具（必须先做，否则 host sed/openssl 不存在）
+        run: |
+          cd "$SRC"
+          export CCACHE_DIR="$HOME/.ccache"
+          set -o pipefail
+          make -j$(nproc) tools/compile V=s 2>&1 | tee -a build.log
+
+      - name:  ★ 编译交叉工具链
+        run: |
+          cd "$SRC"
+          export CCACHE_DIR="$HOME/.ccache"
+          set -o pipefail
+          make -j$(nproc) toolchain/compile V=s 2>&1 | tee -a build.log
+
+      - name:  ★ 只编译 turboacc 包
+        run: |
+          cd "$SRC"
+          export CCACHE_DIR="$HOME/.ccache"
+          set -o pipefail
+          make -j$(nproc) "$PKGDIR/compile" V=s 2>&1 | tee -a build.log
+
+      - name:  收集 apk
+        run: |
+          cd "$SRC"
+          mkdir -p out
+          find bin/packages -type f \( -name 'luci-app-turboacc*.apk' \
+                                      -o -name 'luci-i18n-turboacc*.apk' \) \
+               -exec cp -v {} out/ \;
+          echo "=== out/ ==="
+          ls -lh out/
+          [ -n "$(ls -A out/)" ] || { echo "::error::没有产出任何 apk"; exit 1; }
+          (cd out && sha256sum * > sha256sums && cat sha256sums)
+
+      - name:  上传 apk
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turboacc-apk-${{ github.run_number }}
+          path: fanchmwrt/out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name:  失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turboacc-build-log-${{ github.run_number }}
+          path: fanchmwrt/build.log
+          retention-days: 7
